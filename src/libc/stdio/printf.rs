@@ -13,7 +13,6 @@ use crate::libc::errno::set_errno;
 use crate::libc::posix_io::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 use crate::libc::stdio::{fwrite, getc, ungetc, EOF, FILE};
 use crate::libc::stdlib::{atof_inner_generic, str_to_int_inner_generic};
-use crate::libc::string::strlen;
 use crate::libc::wchar::wchar_t;
 use crate::mem::{guest_size_of, ConstPtr, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{id, msg, nil};
@@ -21,526 +20,645 @@ use crate::Environment;
 use std::collections::HashSet;
 use std::io::Write;
 
-const ALL_SPECIFIERS: [u8; 25] = [
-    // IEEE printf specification
-    b'd', b'i', b'o', b'u', b'x', b'X', b'f', b'F', b'e', b'E', b'g', b'G', b'a', b'A', b'c', b's',
-    b'p', b'n', b'C', b'S', b'%', // NSString formatting
-    b'@', b'D', b'U', b'O',
-];
+#[derive(Clone, Copy, Default)]
+struct FormatFlags {
+    sign: bool,
+    space: bool,
+    alternate: bool,
+    zero: bool,
+    left: bool,
+}
 
-const INTEGER_SPECIFIERS: [u8; 6] = *b"diouxX";
-const FLOAT_SPECIFIERS: [u8; 3] = *b"feg";
+enum FormatCount {
+    Literal(usize),
+    Argument,
+}
 
-/// String formatting implementation for `printf` and `NSLog` function families.
+struct Conversion {
+    flags: FormatFlags,
+    width: FormatCount,
+    precision: Option<FormatCount>,
+    length: Option<&'static str>,
+    specifier: u8,
+}
+
+impl Conversion {
+    /// Parse one conversion, starting just after '%'. Argument widths and
+    /// precisions are resolved separately, before reading the value itself.
+    fn parse(get: impl Fn(usize) -> u8, index: &mut usize) -> Self {
+        let mut flags = FormatFlags::default();
+        loop {
+            match get(*index) {
+                b'+' => flags.sign = true,
+                b' ' => flags.space = true,
+                b'#' => flags.alternate = true,
+                b'0' => flags.zero = true,
+                b'-' => flags.left = true,
+                _ => break,
+            }
+            *index += 1;
+        }
+        let count = |index: &mut usize| {
+            if get(*index) == b'*' {
+                *index += 1;
+                FormatCount::Argument
+            } else {
+                let mut value = 0;
+                while let c @ b'0'..=b'9' = get(*index) {
+                    value = value * 10 + (c - b'0') as usize;
+                    *index += 1;
+                }
+                FormatCount::Literal(value)
+            }
+        };
+        let width = count(index);
+        let precision = if get(*index) == b'.' {
+            *index += 1;
+            Some(count(index))
+        } else {
+            None
+        };
+        let length = match get(*index) {
+            b'h' | b'l' => {
+                let c = get(*index);
+                *index += 1;
+                let doubled = get(*index) == c;
+                if doubled {
+                    *index += 1;
+                }
+                Some(match (c, doubled) {
+                    (b'h', false) => "h",
+                    (b'h', true) => "hh",
+                    (b'l', false) => "l",
+                    _ => "ll",
+                })
+            }
+            b'q' | b'j' => {
+                *index += 1;
+                Some("ll")
+            }
+            b'z' | b't' => {
+                *index += 1;
+                Some("l")
+            }
+            b'L' => {
+                *index += 1;
+                Some("L")
+            }
+            _ => None,
+        };
+        let specifier = get(*index);
+        *index += 1;
+        Self {
+            flags,
+            width,
+            precision,
+            length,
+            specifier,
+        }
+    }
+
+    fn resolve(&self, mut next: impl FnMut() -> i32) -> FieldFormat {
+        let mut flags = self.flags;
+        let width = match self.width {
+            FormatCount::Literal(value) => value,
+            FormatCount::Argument => {
+                let width = next();
+                flags.left |= width < 0;
+                width.unsigned_abs() as usize
+            }
+        };
+        let precision = match self.precision {
+            Some(FormatCount::Literal(value)) => Some(value),
+            Some(FormatCount::Argument) => usize::try_from(next()).ok(),
+            None => None,
+        };
+        FieldFormat {
+            flags,
+            width,
+            precision,
+        }
+    }
+}
+
+struct FieldFormat {
+    flags: FormatFlags,
+    width: usize,
+    precision: Option<usize>,
+}
+
+impl FieldFormat {
+    fn sign(&self, negative: bool) -> &'static str {
+        if negative {
+            "-"
+        } else if self.flags.sign {
+            "+"
+        } else if self.flags.space {
+            " "
+        } else {
+            ""
+        }
+    }
+
+    /// Zero padding follows the sign and radix prefix. Left adjustment always
+    /// wins over zero padding; integer precision also disables zero padding.
+    fn number(&self, prefix: &str, digits: &str, zero: bool) -> Vec<u8> {
+        let padding = self.width.saturating_sub(prefix.len() + digits.len());
+        let mut result = Vec::new();
+        if !self.flags.left && !zero {
+            result.resize(padding, b' ');
+        }
+        result.extend_from_slice(prefix.as_bytes());
+        if !self.flags.left && zero {
+            result.resize(result.len() + padding, b'0');
+        }
+        result.extend_from_slice(digits.as_bytes());
+        if self.flags.left {
+            result.resize(result.len() + padding, b' ');
+        }
+        result
+    }
+
+    fn text(&self, bytes: &[u8]) -> Vec<u8> {
+        let padding = self.width.saturating_sub(bytes.len());
+        let mut result = Vec::new();
+        if !self.flags.left {
+            result.resize(padding, b' ');
+        }
+        result.extend_from_slice(bytes);
+        if self.flags.left {
+            result.resize(result.len() + padding, b' ');
+        }
+        result
+    }
+
+    fn integer(&self, magnitude: u64, negative: bool, specifier: u8) -> Vec<u8> {
+        let mut digits = match specifier {
+            b'o' => format!("{magnitude:o}"),
+            b'x' | b'p' => format!("{magnitude:x}"),
+            b'X' => format!("{magnitude:X}"),
+            _ => magnitude.to_string(),
+        };
+        if self.precision == Some(0) && magnitude == 0 {
+            digits.clear();
+        }
+        if let Some(precision) = self.precision {
+            digits = format!(
+                "{}{}",
+                "0".repeat(precision.saturating_sub(digits.len())),
+                digits
+            );
+        }
+        let prefix = match specifier {
+            b'd' | b'i' => self.sign(negative),
+            b'x' if self.flags.alternate && magnitude != 0 => "0x",
+            b'X' if self.flags.alternate && magnitude != 0 => "0X",
+            b'o' if self.flags.alternate && !digits.starts_with('0') => "0",
+            // iOS formats a null pointer as 0x0, too.
+            b'p' => "0x",
+            _ => "",
+        };
+        self.number(prefix, &digits, self.flags.zero && self.precision.is_none())
+    }
+
+    fn float(&self, value: f64, specifier: u8) -> Vec<u8> {
+        let magnitude = value.abs();
+        let spec = specifier.to_ascii_lowercase();
+        let precision = self.precision.unwrap_or(6);
+        let mut digits = if value.is_nan() {
+            "nan".to_owned()
+        } else if value.is_infinite() {
+            "inf".to_owned()
+        } else {
+            match spec {
+                b'f' => format!("{magnitude:.precision$}"),
+                b'e' => scientific(magnitude, precision),
+                b'g' => {
+                    let precision = precision.max(1);
+                    // Choose notation using the exponent after rounding to
+                    // P significant digits (e.g. %.3g of 999.9 is 1e+03).
+                    let scientific = scientific(magnitude, precision - 1);
+                    let (_, exponent) = scientific.split_once('e').unwrap();
+                    let exponent: i32 = exponent.parse().unwrap();
+                    let mut text = if exponent >= -4 && exponent < precision as i32 {
+                        let decimals = (precision as i64 - exponent as i64 - 1) as usize;
+                        format!("{magnitude:.decimals$}")
+                    } else {
+                        scientific
+                    };
+                    if !self.flags.alternate {
+                        let end = text.find('e').unwrap_or(text.len());
+                        if text[..end].contains('.') {
+                            let trimmed = text[..end]
+                                .trim_end_matches('0')
+                                .trim_end_matches('.')
+                                .len();
+                            text.replace_range(trimmed..end, "");
+                        }
+                    }
+                    text
+                }
+                _ => unreachable!(),
+            }
+        };
+        if self.flags.alternate && value.is_finite() && !digits.contains('.') {
+            let end = digits.find('e').unwrap_or(digits.len());
+            digits.insert(end, '.');
+        }
+        // Darwin does not print a sign for NaN, even with '+' or a sign bit.
+        let prefix = if value.is_nan() {
+            ""
+        } else {
+            self.sign(value.is_sign_negative())
+        };
+        if specifier.is_ascii_uppercase() {
+            digits.make_ascii_uppercase();
+        }
+        // Infinity and NaN are space-padded even when '0' was requested.
+        self.number(prefix, &digits, self.flags.zero && value.is_finite())
+    }
+}
+
+fn scientific(value: f64, precision: usize) -> String {
+    let text = format!("{value:.precision$e}");
+    let (mantissa, exponent) = text.split_once('e').unwrap();
+    let exponent: i32 = exponent.parse().unwrap();
+    format!("{mantissa}e{exponent:+03}")
+}
+
+/// String formatting for printf and NSLog. Guest arguments are decoded here;
+/// shared field formatting handles signs, precision, and width in that order.
 ///
-/// `NS_LOG` is [true] for the `NSLog` format string type, or [false] for the
-/// `printf` format string type.
-///
-/// `get_format_char` is a callback that returns the byte at a given index in
-/// the format string, or `'\0'` if the index is one past the last byte.
+/// `NS_LOG` enables NSString's `%@` object descriptions. `get_format_char`
+/// returns the byte at the given index, or zero at the end of the format.
 pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
     env: &mut Environment,
     get_format_char: F,
     mut args: VaList,
 ) -> Vec<u8> {
-    let mut res = Vec::<u8>::new();
-
-    let mut format_char_idx = 0;
-
+    let mut res = Vec::new();
+    let mut index = 0usize;
     loop {
-        let c = get_format_char(&env.mem, format_char_idx);
-        format_char_idx += 1;
-
-        if c == b'\0' {
+        let c = get_format_char(&env.mem, index as GuestUSize);
+        index += 1;
+        if c == 0 {
             break;
         }
         if c != b'%' {
             res.push(c);
             continue;
         }
-
-        let prepend_sign = if get_format_char(&env.mem, format_char_idx) == b'+' {
-            format_char_idx += 1;
-            true
-        } else {
-            false
+        let conversion =
+            Conversion::parse(|i| get_format_char(&env.mem, i as GuestUSize), &mut index);
+        let field = conversion.resolve(|| args.next::<i32>(env));
+        let length = conversion.length;
+        let specifier = match conversion.specifier {
+            b'D' => b'd',
+            b'U' => b'u',
+            b'O' => b'o',
+            other => other,
         };
-
-        if get_format_char(&env.mem, format_char_idx) == b'#' {
-            // Alternative form handling
-            format_char_idx += 1;
-            // TODO: other specifiers
-            assert!(get_format_char(&env.mem, format_char_idx) == b'.');
-            // TODO: other cases
-            assert!(get_format_char(&env.mem, format_char_idx + 2) == b'd');
-        }
-
-        let pad_char = if get_format_char(&env.mem, format_char_idx) == b'0' {
-            format_char_idx += 1;
-            '0'
-        } else {
-            ' '
-        };
-
-        let left_justified = if get_format_char(&env.mem, format_char_idx) == b'-' {
-            format_char_idx += 1;
-            true
-        } else {
-            false
-        };
-        let pad_width = if get_format_char(&env.mem, format_char_idx) == b'*' {
-            let pad_width = args.next::<i32>(env);
-            format_char_idx += 1;
-            pad_width
-        } else {
-            let mut pad_width: i32 = 0;
-            while let c @ b'0'..=b'9' = get_format_char(&env.mem, format_char_idx) {
-                pad_width = pad_width * 10 + (c - b'0') as i32;
-                format_char_idx += 1;
+        let bytes = match specifier {
+            0 => break,
+            b'%' => vec![b'%'],
+            b'd' | b'i' => {
+                let value: i64 = match length {
+                    Some("ll") => args.next(env),
+                    Some("hh") => args.next::<i8>(env).into(),
+                    Some("h") => args.next::<i16>(env).into(),
+                    _ => args.next::<i32>(env).into(),
+                };
+                field.integer(value.unsigned_abs(), value < 0, specifier)
             }
-            pad_width
-        };
-        assert!(pad_width >= 0); // TODO: Implement right-padding
-
-        let precision = if get_format_char(&env.mem, format_char_idx) == b'.' {
-            format_char_idx += 1;
-            let precision = if get_format_char(&env.mem, format_char_idx) == b'*' {
-                let precision = args.next::<i32>(env);
-                assert!(precision >= 0); // TODO: ignore negative
-                format_char_idx += 1;
-                precision as usize
-            } else {
-                let mut precision = 0;
-                while let c @ b'0'..=b'9' = get_format_char(&env.mem, format_char_idx) {
-                    precision = precision * 10 + (c - b'0') as usize;
-                    format_char_idx += 1;
-                }
-                precision
-            };
-            Some(precision)
-        } else {
-            None
-        };
-
-        let length_modifier = match get_format_char(&env.mem, format_char_idx) {
-            b'h' => {
-                format_char_idx += 1;
-                if get_format_char(&env.mem, format_char_idx) == b'h' {
-                    format_char_idx += 1;
-                    Some("hh")
+            b'u' | b'o' | b'x' | b'X' => {
+                let value: u64 = match length {
+                    Some("ll") => args.next(env),
+                    Some("hh") => args.next::<u8>(env).into(),
+                    Some("h") => args.next::<u16>(env).into(),
+                    _ => args.next::<u32>(env).into(),
+                };
+                field.integer(value, false, specifier)
+            }
+            b'p' => {
+                let ptr: MutVoidPtr = args.next(env);
+                field.integer(ptr.to_bits().into(), false, b'p')
+            }
+            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
+                // ARM iOS long double has the same representation as double.
+                field.float(args.next::<f64>(env), specifier)
+            }
+            b'c' if length != Some("l") => field.text(&[args.next::<u8>(env)]),
+            b'c' | b'C' => {
+                let c = if specifier == b'C' {
+                    args.next::<unichar>(env).into()
                 } else {
-                    Some("h")
-                }
-            }
-            b'l' => {
-                format_char_idx += 1;
-                if get_format_char(&env.mem, format_char_idx) == b'l' {
-                    format_char_idx += 1;
-                    Some("ll")
-                } else {
-                    Some("l")
-                }
-            }
-            // q seems to be an equivalent of 'll'
-            // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Strings/Articles/formatSpecifiers.html#//apple_ref/doc/uid/TP40004265-SW1
-            b'q' => {
-                format_char_idx += 1;
-                Some("ll")
-            }
-            b'j' | b'z' | b't' | b'L' => unimplemented!(),
-            _ => None,
-        };
-
-        let specifier = get_format_char(&env.mem, format_char_idx);
-        format_char_idx += 1;
-
-        if !ALL_SPECIFIERS.contains(&specifier) {
-            // According to `printf` specs, this behaviour is undefined.
-            // But as seen on both macOS and iOS, the '%' just got skipped.
-            // Also, we need to back-track 1 position
-            format_char_idx -= 1;
-            continue;
-        }
-
-        if specifier == b'\0' {
-            // Apparently, errno is not set in this case (tested on macOS),
-            // thus we treat this situation as a normal
-            // and just stop the formatting.
-            assert_eq!(b'%', get_format_char(&env.mem, format_char_idx - 2));
-            log!("printf_inner encountered '%' at the end of format string, ignoring.");
-            break;
-        }
-        if specifier == b'%' {
-            res.push(b'%');
-            continue;
-        }
-
-        if precision.is_some() {
-            assert!(
-                INTEGER_SPECIFIERS.contains(&specifier)
-                    || FLOAT_SPECIFIERS.contains(&specifier)
-                    || specifier == b's'
-            )
-        }
-
-        match specifier {
-            // Integer specifiers
-            b'c' => {
-                assert!(!prepend_sign);
-                assert!(!left_justified);
-                // TODO: support length modifier
-                assert!(length_modifier.is_none());
-                let c: u8 = args.next(env);
-                assert!(pad_char == ' ' && pad_width == 0); // TODO
-                res.push(c);
-            }
-            // Apple extension? Seemingly works in both NSLog and printf.
-            b'C' => {
-                assert!(!prepend_sign);
-                assert!(!left_justified);
-                assert!(length_modifier.is_none());
-                let c: unichar = args.next(env);
-                // TODO
-                assert!(pad_char == ' ' && pad_width == 0);
-                // This will panic if it's a surrogate! This isn't good if
-                // targeting UTF-16 ([NSString stringWithFormat:] etc).
-                let c = char::from_u32(c.into()).unwrap();
-                write!(&mut res, "{c}").unwrap();
+                    args.next::<wchar_t>(env) as u32
+                };
+                // TODO: support isolated UTF-16 surrogates in NSString formats.
+                let c = char::from_u32(c).unwrap();
+                field.text(c.encode_utf8(&mut [0; 4]).as_bytes())
             }
             b's' | b'S' => {
-                assert!(!prepend_sign);
-                if length_modifier == Some("l") || specifier == b'S' {
-                    if specifier == b'S' {
-                        assert!(length_modifier.is_none());
-                    }
-                    assert!(precision.is_none());
-                    assert!(!left_justified);
+                if length == Some("l") || specifier == b'S' {
                     let ctype_locale = setlocale(env, LC_CTYPE, Ptr::null());
                     assert_eq!(env.mem.read(ctype_locale), b'C');
-                    let w_string: ConstPtr<wchar_t> = args.next(env);
-                    assert!(pad_char == ' ' && pad_width == 0); // TODO
-                    if !w_string.is_null() {
-                        res.extend_from_slice(env.mem.wcstr_at(w_string).as_bytes());
+                    let ptr: ConstPtr<wchar_t> = args.next(env);
+                    let text = if ptr.is_null() {
+                        "(null)".to_owned()
                     } else {
-                        res.extend_from_slice("(null)".as_bytes());
+                        env.mem.wcstr_at(ptr)
+                    };
+                    let mut end = field.precision.unwrap_or(text.len()).min(text.len());
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
                     }
+                    field.text(&text.as_bytes()[..end])
                 } else {
-                    assert!(length_modifier.is_none()); // TODO
-                    let c_string: ConstPtr<u8> = args.next(env);
-                    assert!(pad_char == ' '); // TODO
-                    if !c_string.is_null() {
-                        if let Some(precision) = precision {
-                            assert!(!left_justified);
-                            let str_len = strlen(env, c_string);
-                            res.extend_from_slice(
-                                env.mem.bytes_at(c_string, str_len.min(precision as _)),
-                            )
-                        } else if pad_width > 0 {
-                            let pad_width = pad_width as usize;
-                            let str = env.mem.cstr_at_utf8(c_string).unwrap();
-                            if left_justified {
-                                write!(&mut res, "{str:<pad_width$}").unwrap();
-                            } else {
-                                write!(&mut res, "{str:>pad_width$}").unwrap();
+                    let ptr: ConstPtr<u8> = args.next(env);
+                    let mut text = Vec::new();
+                    if ptr.is_null() {
+                        text.extend_from_slice(b"(null)");
+                    } else if let Some(precision) = field.precision {
+                        // %.Ns need not point to a null-terminated string.
+                        for i in 0..precision {
+                            let c = env.mem.read(ptr + i as GuestUSize);
+                            if c == 0 {
+                                break;
                             }
-                        } else {
-                            res.extend_from_slice(env.mem.cstr_at(c_string));
+                            text.push(c);
                         }
                     } else {
-                        assert!(!left_justified);
-                        assert!(precision.is_none());
-                        res.extend_from_slice("(null)".as_bytes());
+                        text.extend_from_slice(env.mem.cstr_at(ptr));
                     }
-                }
-            }
-            b'd' | b'i' | b'u' => {
-                assert!(!left_justified);
-                // Note: on 32-bit system int and long are i32,
-                // so single length_modifier is ignored (but not double one!)
-                let int: i64 = if specifier == b'u' {
-                    if length_modifier == Some("ll") {
-                        let uint: u64 = args.next(env);
-                        uint.try_into().unwrap()
-                    } else if length_modifier == Some("hh") {
-                        let uint: u8 = args.next(env);
-                        uint.into()
-                    } else if length_modifier == Some("h") {
-                        let uint: u16 = args.next(env);
-                        uint.into()
-                    } else {
-                        assert!(length_modifier.is_none() || length_modifier == Some("l"));
-                        let uint: u32 = args.next(env);
-                        uint.into()
+                    if let Some(precision) = field.precision {
+                        text.truncate(precision);
                     }
-                } else if length_modifier == Some("ll") {
-                    args.next(env)
-                } else if length_modifier == Some("hh") {
-                    let int: i8 = args.next(env);
-                    int.into()
-                } else if length_modifier == Some("h") {
-                    let int: i16 = args.next(env);
-                    int.into()
-                } else {
-                    assert!(length_modifier.is_none() || length_modifier == Some("l"));
-                    let int: i32 = args.next(env);
-                    int.into()
-                };
-
-                let int_with_precision = if precision.is_some_and(|value| value > 0) {
-                    format!("{:01$}", int, precision.unwrap())
-                } else {
-                    format!("{int}")
-                };
-
-                if pad_width > 0 {
-                    let pad_width = pad_width as usize;
-                    if pad_char == '0' && precision.is_none() {
-                        if prepend_sign {
-                            assert!(int != 0); // TODO
-                            assert!(pad_width > 0);
-                            if int > 0 {
-                                write!(&mut res, "+{:0>1$}", int, pad_width - 1).unwrap();
-                            } else {
-                                write!(&mut res, "-{:0>1$}", int.abs(), pad_width - 1).unwrap();
-                            }
-                        } else {
-                            write!(&mut res, "{int:0>pad_width$}").unwrap();
-                        }
-                    } else {
-                        assert!(!prepend_sign);
-                        write!(&mut res, "{int_with_precision:>pad_width$}").unwrap();
-                    }
-                } else {
-                    assert!(!prepend_sign);
-                    res.extend_from_slice(int_with_precision.as_bytes());
+                    field.text(&text)
                 }
             }
             b'@' if NS_LOG => {
-                assert!(!prepend_sign);
-                assert!(!left_justified);
-                assert!(length_modifier.is_none());
                 let object: id = args.next(env);
-                // TODO: use localized description if available?
                 let description: id = msg![env; object description];
-                if description != nil {
-                    // TODO: avoid copy
-                    // TODO: what if the description isn't valid UTF-16?
-                    let description = ns_string::to_rust_string(env, description);
-                    write!(&mut res, "{description}").unwrap();
+                let text = if description == nil {
+                    "(null)".to_owned()
                 } else {
-                    write!(&mut res, "(null)").unwrap();
-                }
-            }
-            b'x' => {
-                assert!(!prepend_sign);
-                assert!(!left_justified);
-                // Note: on 32-bit system unsigned int and unsigned long
-                // are u32, so length_modifier is ignored
-                let uint: u32 = if length_modifier == Some("ll") {
-                    let uint: u64 = args.next(env);
-                    uint.try_into().unwrap()
-                } else if length_modifier == Some("hh") {
-                    let uint: u8 = args.next(env);
-                    uint.into()
-                } else if length_modifier == Some("h") {
-                    let uint: u16 = args.next(env);
-                    uint.into()
-                } else {
-                    assert!(length_modifier.is_none() || length_modifier == Some("l"));
-                    let uint: u32 = args.next(env);
-                    uint
+                    ns_string::to_rust_string(env, description).into_owned()
                 };
-                if pad_width > 0 {
-                    assert!(precision.is_none()); // TODO
-                    let pad_width = pad_width as usize;
-                    if pad_char == '0' && precision.is_none() {
-                        write!(&mut res, "{uint:0>pad_width$x}").unwrap();
-                    } else {
-                        write!(&mut res, "{uint:>pad_width$x}").unwrap();
-                    }
-                } else {
-                    let tmp = if precision.is_some_and(|value| value > 0) {
-                        format!("{:01$x}", uint, precision.unwrap())
-                    } else {
-                        if let Some(precision) = precision {
-                            assert!(precision == 0 && uint != 0); // TODO
-                        }
-                        format!("{uint:x}")
-                    };
-                    res.extend_from_slice(tmp.as_bytes());
-                }
+                field.text(text.as_bytes())
             }
-            b'X' => {
-                assert!(!prepend_sign);
-                assert!(!left_justified);
-                assert!(precision.is_none());
-                // Note: on 32-bit system unsigned int and unsigned long
-                // are u32, so length_modifier is ignored
-                let uint: u32 = if length_modifier == Some("ll") {
-                    let uint: u64 = args.next(env);
-                    uint.try_into().unwrap()
-                } else if length_modifier == Some("hh") {
-                    let uint: u8 = args.next(env);
-                    uint.into()
-                } else if length_modifier == Some("h") {
-                    let uint: u16 = args.next(env);
-                    uint.into()
-                } else {
-                    assert!(length_modifier.is_none() || length_modifier == Some("l"));
-                    let uint: u32 = args.next(env);
-                    uint
-                };
-                if pad_width > 0 {
-                    let pad_width = pad_width as usize;
-                    if pad_char == '0' && precision.is_none() {
-                        write!(&mut res, "{uint:0>pad_width$X}").unwrap();
-                    } else {
-                        assert!(pad_char == ' '); // TODO
-                        write!(&mut res, "{uint:>pad_width$X}").unwrap();
-                    }
-                } else {
-                    res.extend_from_slice(format!("{uint:X}").as_bytes());
-                }
+            b'a' | b'A' | b'n' => unimplemented!("printf %{}", specifier as char),
+            _ => {
+                // Undefined conversions on Darwin drop '%' and print the
+                // unknown character. Leave it for the next iteration.
+                index -= 1;
+                continue;
             }
-            b'p' => {
-                assert!(!prepend_sign);
-                assert!(!left_justified);
-                assert!(length_modifier.is_none());
-                let ptr: MutVoidPtr = args.next(env);
-                // '%p' is implementation defined,
-                // but this matches iOS simulator output
-                let tmp = format!("{:#x}", ptr.to_bits());
-                if pad_width > 0 {
-                    let pad_width = pad_width as usize;
-                    assert!(pad_char == ' '); // TODO
-                    write!(&mut res, "{tmp:>pad_width$}").unwrap();
-                } else {
-                    res.extend_from_slice(tmp.as_bytes());
-                }
-            }
-            // Float specifiers
-            b'f' => {
-                assert!(!prepend_sign);
-                assert!(!left_justified);
-                let float: f64 = args.next(env);
-                let pad_width = pad_width as usize;
-                let precision = precision.unwrap_or(6);
-
-                let formatted = f_format(float, pad_width, pad_char, precision);
-                res.extend_from_slice(formatted.as_bytes());
-            }
-            b'e' => {
-                assert!(!prepend_sign);
-                assert!(!left_justified);
-                let float: f64 = args.next(env);
-                let pad_width = pad_width as usize;
-                let precision = precision.unwrap_or(6);
-
-                let formatted = e_format(float, pad_width, pad_char, precision);
-                res.extend_from_slice(formatted.as_bytes());
-            }
-            b'g' => {
-                assert!(!prepend_sign);
-                assert!(!left_justified);
-                let float: f64 = args.next(env);
-                let pad_width = pad_width as usize;
-
-                // Reference https://en.cppreference.com/w/c/io/vfprintf
-                let P: i32 = if let Some(precision) = precision {
-                    if precision == 0 {
-                        1
-                    } else {
-                        precision.try_into().unwrap()
-                    }
-                } else {
-                    6
-                };
-                let X: i32 = if float == 0.0 {
-                    0
-                } else {
-                    float.abs().log10().floor() as i32
-                };
-                log_dbg!(
-                    "float {}, pad_width {}, pad_char '{}', P {}, X {}",
-                    float,
-                    pad_width,
-                    pad_char,
-                    P,
-                    X
-                );
-                if P > X && X >= -4 {
-                    let precision: usize = (P - X - 1).try_into().unwrap();
-
-                    let result = f_format(float, pad_width, pad_char, precision);
-
-                    // TODO: skip if alternative representation is requested
-                    let trimmed_result = if result.contains('.') {
-                        result.trim_end_matches('0').trim_end_matches('.')
-                    } else {
-                        &result
-                    };
-
-                    let trimmed_result = if pad_width > 0 && trimmed_result.len() < pad_width {
-                        if pad_char == '0' {
-                            format!("{trimmed_result:0>pad_width$}")
-                        } else {
-                            format!("{trimmed_result:>pad_width$}")
-                        }
-                    } else {
-                        trimmed_result.to_string()
-                    };
-
-                    res.extend_from_slice(trimmed_result.as_bytes());
-                } else {
-                    let precision: usize = (P - 1).try_into().unwrap();
-
-                    let formatted = e_format(float, pad_width, pad_char, precision);
-                    res.extend_from_slice(formatted.as_bytes());
-                }
-            }
-            // TODO: more specifiers
-            _ => unimplemented!(
-                "Format character '{}'. Formatted up to index {}",
-                specifier as char,
-                format_char_idx
-            ),
-        }
+        };
+        res.extend_from_slice(&bytes);
     }
-
     log_dbg!("=> {:?}", std::str::from_utf8(&res));
-
     res
 }
 
-fn f_format(float: f64, pad_width: usize, pad_char: char, precision: usize) -> String {
-    if pad_char == '0' {
-        format!("{float:0pad_width$.precision$}")
-    } else {
-        assert!(pad_char == ' '); // TODO
-        format!("{float:pad_width$.precision$}")
-    }
-}
+#[cfg(test)]
+mod formatting_tests {
+    use super::*;
 
-fn e_format(float: f64, pad_width: usize, pad_char: char, precision: usize) -> String {
-    let exponent = if float == 0.0 {
-        0.0
-    } else {
-        float.abs().log10().floor()
-    };
-    let mantissa = float.abs() / 10f64.powf(exponent);
-    let sign = if float.is_sign_negative() { "-" } else { "" };
-    if pad_char == '0' {
-        let float_exp_notation = format!("{mantissa:.precision$}e{exponent:+03}");
-        format!(
-            "{0}{1:0>2$}",
-            sign,
-            float_exp_notation,
-            pad_width.saturating_sub(sign.len())
-        )
-    } else {
-        assert!(pad_char == ' '); // TODO
-        let float_exp_notation = format!("{sign}{mantissa:.precision$}e{exponent:+03}");
-        format!("{float_exp_notation:>pad_width$}")
+    fn conversion(format: &str, arguments: &[i32]) -> (Conversion, FieldFormat) {
+        assert!(format.starts_with('%'));
+        let mut index = 1;
+        let conversion = Conversion::parse(
+            |i| format.as_bytes().get(i).copied().unwrap_or(0),
+            &mut index,
+        );
+        assert_eq!(index, format.len());
+        let mut arguments = arguments.iter();
+        let field = conversion.resolve(|| *arguments.next().unwrap());
+        assert!(arguments.next().is_none());
+        (conversion, field)
+    }
+
+    fn integer(format: &str, value: i64, arguments: &[i32]) -> String {
+        let (conversion, field) = conversion(format, arguments);
+        String::from_utf8(field.integer(value.unsigned_abs(), value < 0, conversion.specifier))
+            .unwrap()
+    }
+
+    fn float(format: &str, value: f64) -> String {
+        let (conversion, field) = conversion(format, &[]);
+        String::from_utf8(field.float(value, conversion.specifier)).unwrap()
+    }
+
+    #[test]
+    fn heavy_mach_upgrade_labels() {
+        // The crashed call's CFString at 0x6bdbc points to the first format.
+        // Exercise the same parser and fields used by NSString formatting;
+        // the %@ argument here is its already-resolved object description.
+        for (format, name) in [("%@ : %d(%+d)", "Attack"), ("Size : %d(%+d)", "")] {
+            for (change, expected) in [(5, "+5"), (0, "+0"), (-5, "-5")] {
+                let mut result = Vec::new();
+                let mut values = [20i64, change].into_iter();
+                let mut index = 0;
+                while index < format.len() {
+                    let c = format.as_bytes()[index];
+                    index += 1;
+                    if c != b'%' {
+                        result.push(c);
+                        continue;
+                    }
+                    let conversion = Conversion::parse(
+                        |i| format.as_bytes().get(i).copied().unwrap_or(0),
+                        &mut index,
+                    );
+                    let field = conversion.resolve(|| panic!("unexpected '*'"));
+                    let bytes = if conversion.specifier == b'@' {
+                        field.text(name.as_bytes())
+                    } else {
+                        let value = values.next().unwrap();
+                        field.integer(value.unsigned_abs(), value < 0, conversion.specifier)
+                    };
+                    result.extend(bytes);
+                }
+                let label = if name.is_empty() { "Size" } else { name };
+                assert_eq!(
+                    String::from_utf8(result).unwrap(),
+                    format!("{label} : 20({expected})")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn signs_width_and_precision() {
+        for (format, value, expected) in [
+            ("%+d", 5, "+5"),
+            ("%+d", 0, "+0"),
+            ("%+i", -5, "-5"),
+            ("%+6d", 5, "    +5"),
+            ("%+06d", 5, "+00005"),
+            ("%06d", -5, "-00005"),
+            ("%+06d", 0, "+00000"),
+            ("%+08.4d", -5, "   -0005"),
+            ("%+08.4d", 5, "   +0005"),
+            ("%-+08.4d", 5, "+0005   "),
+            ("%0+ -8.4d", 5, "+0005   "),
+            ("% d", 5, " 5"),
+            ("% +d", 5, "+5"),
+            ("% 06d", 5, " 00005"),
+            ("%.0d", 0, ""),
+            ("%+.0d", 0, "+"),
+            ("%+4.0d", 0, "   +"),
+            ("%+.3d", -5, "-005"),
+            ("%+#.2d", 5, "+05"),
+            ("%+lld", i64::MIN, "-9223372036854775808"),
+        ] {
+            assert_eq!(integer(format, value, &[]), expected, "{format}, {value}");
+        }
+        assert_eq!(integer("%+0*d", 5, &[-6]), "+5    ");
+        assert_eq!(integer("%+0*.*d", 5, &[6, -1]), "+00005");
+        assert_eq!(integer("%+0*.*d", 5, &[-8, 4]), "+0005   ");
+    }
+
+    #[test]
+    fn unsigned_radices_and_text_fields() {
+        for (format, value, expected) in [
+            ("%llu", u64::MAX, "18446744073709551615"),
+            ("%llX", u64::MAX, "FFFFFFFFFFFFFFFF"),
+            ("%#08x", 42, "0x00002a"),
+            ("%#08.4X", 42, "  0X002A"),
+            ("%-#8x", 42, "0x2a    "),
+            ("%#x", 0, "0"),
+            ("%#.0x", 0, ""),
+            ("%#o", 8, "010"),
+            ("%#.0o", 0, "0"),
+            ("%#.4o", 8, "0010"),
+            ("%+#u", 5, "5"),
+            ("%08p", 42, "0x00002a"),
+            ("%p", 0, "0x0"),
+        ] {
+            let (conversion, field) = conversion(format, &[]);
+            assert_eq!(
+                field.integer(value, false, conversion.specifier),
+                expected.as_bytes(),
+                "{format}"
+            );
+        }
+        let (_, field) = conversion("%-5s", &[]);
+        assert_eq!(field.text(b"abc"), b"abc  ");
+        let (_, field) = conversion("%3c", &[]);
+        assert_eq!(field.text(&[0xff]), [b' ', b' ', 0xff]);
+    }
+
+    #[test]
+    fn floating_point_edges() {
+        for (format, value, expected) in [
+            ("%+08.2f", 5.0, "+0005.00"),
+            ("%-+8.2f", 5.0, "+5.00   "),
+            ("%+.0f", -0.0, "-0"),
+            ("%+#.0F", 5.0, "+5."),
+            ("%+.1E", 99.99, "+1.0E+02"),
+            ("%.3g", 999.9, "1e+03"),
+            ("%.1g", 0.00009999, "0.0001"),
+            ("%+#.3G", 5.0, "+5.00"),
+            ("%+.3g", 100000.0, "+1e+05"),
+            ("%+010.3g", -5.0, "-000000005"),
+            ("%+08F", f64::INFINITY, "    +INF"),
+            ("%+08f", f64::NEG_INFINITY, "    -inf"),
+            ("%+08f", f64::NAN, "     nan"),
+            ("%+08F", -f64::NAN, "     NAN"),
+        ] {
+            assert_eq!(float(format, value), expected, "{format}, {value}");
+        }
+    }
+
+    #[test]
+    fn numeric_formats_match_host_printf() {
+        // Independent oracle for combinations and rounding boundaries. Only
+        // controlled numeric formats and matching C argument types go to libc.
+        let mut buffer = [0u8; 2048];
+        for flags in ["", "+", " ", "0", "+0", "-+0", "#", "+#0", " #0", "0- +#"] {
+            for width in ["", "1", "20"] {
+                for precision in ["", ".0", ".1", ".3", ".8", ".15"] {
+                    for spec in [b'd', b'i', b'u', b'o', b'x', b'X'] {
+                        let format = format!("%{flags}{width}{precision}ll{}", spec as char);
+                        let c_format = std::ffi::CString::new(format.clone()).unwrap();
+                        let (_, field) = conversion(&format, &[]);
+                        for bits in [0u64, 1, 42, i64::MAX as u64, i64::MIN as u64, u64::MAX] {
+                            let signed = matches!(spec, b'd' | b'i');
+                            let value = bits as i64;
+                            let actual = field.integer(
+                                if signed { value.unsigned_abs() } else { bits },
+                                signed && value < 0,
+                                spec,
+                            );
+                            // SAFETY: the format has exactly one ll integer
+                            // conversion; buffer has the given writable size.
+                            let count = unsafe {
+                                if signed {
+                                    libc::snprintf(
+                                        buffer.as_mut_ptr().cast(),
+                                        buffer.len(),
+                                        c_format.as_ptr(),
+                                        value as libc::c_longlong,
+                                    )
+                                } else {
+                                    libc::snprintf(
+                                        buffer.as_mut_ptr().cast(),
+                                        buffer.len(),
+                                        c_format.as_ptr(),
+                                        bits as libc::c_ulonglong,
+                                    )
+                                }
+                            };
+                            assert!(count >= 0 && (count as usize) < buffer.len());
+                            assert_eq!(actual, buffer[..count as usize], "{format}, {bits}");
+                        }
+                    }
+                    for spec in [b'f', b'F', b'e', b'E', b'g', b'G'] {
+                        let format = format!("%{flags}{width}{precision}{}", spec as char);
+                        let c_format = std::ffi::CString::new(format.clone()).unwrap();
+                        for value in [
+                            0.0,
+                            -0.0,
+                            1.5,
+                            -42.25,
+                            9.9999,
+                            999.9,
+                            0.00009999,
+                            1e-20,
+                            1e20,
+                            f64::MAX,
+                            f64::MIN_POSITIVE,
+                            f64::from_bits(1),
+                            f64::INFINITY,
+                            f64::NEG_INFINITY,
+                            f64::NAN,
+                        ] {
+                            // NaN sign conventions differ between C libraries.
+                            if value.is_nan() && !cfg!(target_vendor = "apple") {
+                                continue;
+                            }
+                            // SAFETY: the format has exactly one double
+                            // conversion; buffer has the given writable size.
+                            let count = unsafe {
+                                libc::snprintf(
+                                    buffer.as_mut_ptr().cast(),
+                                    buffer.len(),
+                                    c_format.as_ptr(),
+                                    value,
+                                )
+                            };
+                            assert!(count >= 0 && (count as usize) < buffer.len());
+                            assert_eq!(
+                                float(&format, value).as_bytes(),
+                                &buffer[..count as usize],
+                                "{format}, {value}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
