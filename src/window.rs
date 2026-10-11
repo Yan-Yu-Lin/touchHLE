@@ -105,6 +105,18 @@ fn rotate_fullscreen_size(orientation: DeviceOrientation, screen_size: (u32, u32
         }
     }
 }
+
+fn window_size_for_orientation(
+    family: DeviceFamily,
+    orientation: DeviceOrientation,
+    scale: f32,
+) -> (u32, u32) {
+    let (width, height) = size_for_orientation(family, orientation, NonZeroU32::new(1).unwrap());
+    (
+        ((width as f64 * scale as f64).round() as u32).max(1),
+        ((height as f64 * scale as f64).round() as u32).max(1),
+    )
+}
 /// Tell SDL2 what orientation we want. Only useful on Android.
 fn set_sdl2_orientation(orientation: DeviceOrientation) {
     // Despite the name, this hint works on Android too.
@@ -228,7 +240,7 @@ pub struct Window {
     /// Copy of `fullscreen` on [Options]. Note that this is meaningless when
     /// [Self::rotatable_fullscreen] returns [true].
     fullscreen: bool,
-    scale_hack: NonZeroU32,
+    window_scale: f32,
     internal_gl_ins: Option<Box<dyn GLESContext>>,
     splash_image: Option<Image>,
     device_family: DeviceFamily,
@@ -292,6 +304,7 @@ impl Window {
         video_ctx.enable_screen_saver();
 
         let scale_hack = options.scale_hack;
+        let window_scale = options.window_scale.unwrap_or(scale_hack.get() as f32);
         // TODO: some apps specify their orientation in Info.plist, we could use
         // that here.
         let device_family = options.device_family.unwrap_or(DeviceFamily::iPhone);
@@ -321,7 +334,7 @@ impl Window {
             window
         } else {
             let (width, height) =
-                size_for_orientation(device_family, device_orientation, scale_hack);
+                window_size_for_orientation(device_family, device_orientation, window_scale);
             let window = video_ctx
                 .window(title, width, height)
                 .position_centered()
@@ -377,7 +390,7 @@ impl Window {
             #[cfg(target_os = "macos")]
             viewport_y_offset: 0,
             fullscreen,
-            scale_hack,
+            window_scale,
             internal_gl_ins: None,
             splash_image: launch_image,
             device_family,
@@ -1285,7 +1298,7 @@ impl Window {
                 set_sdl2_orientation(new_orientation);
                 rotate_fullscreen_size(new_orientation, self.window.size())
             } else {
-                size_for_orientation(self.device_family, new_orientation, self.scale_hack)
+                window_size_for_orientation(self.device_family, new_orientation, self.window_scale)
             };
 
             // macOS quirk: when resizing the window, the new framebuffer's size
@@ -1360,13 +1373,19 @@ impl Window {
     /// The aspect ratio of this region always reflects the guest app's view of
     /// the world, but the scale and orientation might not.
     pub fn viewport(&self) -> (u32, u32, u32, u32) {
-        let (app_width, app_height) =
-            size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
-        if !self.fullscreen && !Self::rotatable_fullscreen() {
-            return (0, 0, app_width, app_height);
-        }
-
-        let (screen_width, screen_height) = self.window.drawable_size();
+        let (app_width, app_height) = size_for_orientation(
+            self.device_family,
+            self.device_orientation,
+            NonZeroU32::new(1).unwrap(),
+        );
+        let (screen_width, screen_height) = if !self.fullscreen && !Self::rotatable_fullscreen() {
+            // Use logical window dimensions, also used by mouse events. On
+            // macOS the drawable can retain its old size after rotation; the
+            // drawing-only viewport_y_offset handles that separately.
+            self.window.size()
+        } else {
+            self.window.drawable_size()
+        };
 
         let app_aspect = app_width as f32 / app_height as f32;
         let screen_aspect = screen_width as f32 / screen_height as f32;
@@ -1543,4 +1562,34 @@ pub fn get_preferred_country_codes(env: &mut Environment) -> Vec<String> {
             .filter_map(|loc| loc.country)
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{window_size_for_orientation, DeviceFamily, DeviceOrientation};
+
+    #[test]
+    fn fractional_window_sizes_follow_device_orientation() {
+        use DeviceOrientation::*;
+        for orientation in [Portrait, PortraitUpsideDown] {
+            assert_eq!(
+                window_size_for_orientation(DeviceFamily::iPhone, orientation, 1.5),
+                (480, 720)
+            );
+        }
+        for orientation in [LandscapeLeft, LandscapeRight] {
+            assert_eq!(
+                window_size_for_orientation(DeviceFamily::iPhone, orientation, 1.5),
+                (720, 480)
+            );
+        }
+        assert_eq!(
+            window_size_for_orientation(DeviceFamily::iPad, Portrait, 0.5),
+            (384, 512)
+        );
+        assert_eq!(
+            window_size_for_orientation(DeviceFamily::iPhone, Portrait, 0.0001),
+            (1, 1)
+        );
+    }
 }

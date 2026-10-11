@@ -23,7 +23,7 @@ View options:
         do this. These options may be useful in that case.
 
     --scale-hack=...
-        Set a scaling factor for the window. touchHLE will attempt to run the
+        Set an internal rendering scale factor. touchHLE will attempt to run the
         app with an increased internal resolution. This is a hack and there's
         no guarantee it will work correctly for all apps.
 
@@ -31,6 +31,20 @@ View options:
         a scale of 1×).
 
         This is a natural number that is at least 1.
+
+        Unless --window-scale is specified, this also sets the window size.
+
+    --window-scale=...
+        Set the desktop window size independently of the internal rendering
+        resolution. Accepts a positive, finite decimal such as 1.5. The guest
+        screen size is unchanged, and the output is scaled to fit the window.
+
+        For example, --scale-hack=2 --window-scale=1.5 renders at 2x resolution
+        in a 1.5x window (480x720 for an iPhone in portrait, excluding the title
+        bar). Mouse and touch input follow the displayed size.
+
+        If omitted, the window scale follows --scale-hack (1 by default).
+        Ignored in full screen and on Android.
 
 Device options:
     --device-family=...

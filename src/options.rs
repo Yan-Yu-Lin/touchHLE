@@ -38,6 +38,7 @@ pub struct Options {
     pub device_family: Option<DeviceFamily>,
     pub initial_orientation: DeviceOrientation,
     pub scale_hack: NonZeroU32,
+    pub window_scale: Option<f32>,
     pub deadzone: f32,
     pub analog_stick_tilt_controls: bool,
     pub x_tilt_range: f32,
@@ -71,6 +72,7 @@ impl Default for Options {
             device_family: None,
             initial_orientation: DeviceOrientation::Portrait,
             scale_hack: NonZeroU32::new(1).unwrap(),
+            window_scale: None,
             analog_stick_tilt_controls: true,
             deadzone: 0.1,
             x_tilt_range: 60.0,
@@ -130,6 +132,19 @@ impl Options {
             self.scale_hack = value
                 .parse()
                 .map_err(|_| "Invalid scale hack factor".to_string())?;
+        } else if let Some(value) = arg.strip_prefix("--window-scale=") {
+            let scale: f32 = value
+                .parse()
+                .map_err(|_| "Invalid window scale factor".to_string())?;
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err("Window scale factor must be positive and finite".to_string());
+            }
+            // SDL window dimensions are signed 32-bit integers. Allow either
+            // device family and orientation (the longest side is 1024).
+            if scale as f64 * 1024.0 > i32::MAX as f64 {
+                return Err("Window scale factor is too large".to_string());
+            }
+            self.window_scale = Some(scale);
         } else if arg == "--disable-analog-stick-tilt-controls" {
             self.analog_stick_tilt_controls = false;
         } else if let Some(value) = arg.strip_prefix("--deadzone=") {
@@ -333,4 +348,38 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
         }
     }
     Ok(dumping_options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Options;
+
+    #[test]
+    fn window_scale_is_independent_of_render_scale() {
+        for args in [
+            ["--scale-hack=2", "--window-scale=1.5"],
+            ["--window-scale=1.5", "--scale-hack=2"],
+        ] {
+            let mut options = Options::default();
+            assert_eq!(options.window_scale, None);
+            for arg in args {
+                assert_eq!(options.parse_argument(arg), Ok(true));
+            }
+            assert_eq!(options.scale_hack.get(), 2);
+            assert_eq!(options.window_scale, Some(1.5));
+        }
+    }
+
+    #[test]
+    fn window_scale_rejects_invalid_values() {
+        let mut options = Options::default();
+        for value in ["", "abc", "0", "-1", "NaN", "inf", "-inf", "1e30"] {
+            assert!(options
+                .parse_argument(&format!("--window-scale={value}"))
+                .is_err());
+            assert_eq!(options.window_scale, None);
+        }
+        assert_eq!(options.parse_argument("--window-scale=0.5"), Ok(true));
+        assert_eq!(options.window_scale, Some(0.5));
+    }
 }
