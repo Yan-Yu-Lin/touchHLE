@@ -87,6 +87,7 @@ pub(crate) struct UIViewHostObject {
     clears_context_before_drawing: bool,
     user_interaction_enabled: bool,
     multiple_touch_enabled: bool,
+    needs_layout: bool,
 }
 impl HostObject for UIViewHostObject {}
 impl Default for UIViewHostObject {
@@ -102,6 +103,7 @@ impl Default for UIViewHostObject {
             clears_context_before_drawing: true,
             user_interaction_enabled: true,
             multiple_touch_enabled: false,
+            needs_layout: true,
         }
     }
 }
@@ -122,6 +124,27 @@ impl HostObject for UIViewAnimationDelegateHostObject {}
 pub fn set_view_controller(env: &mut Environment, view: id, controller: id) {
     let host_obj = env.objc.borrow_mut::<UIViewHostObject>(view);
     host_obj.view_controller = controller;
+}
+
+/// Lay out views created or resized since the previous display update.
+pub fn layout_views(env: &mut Environment) {
+    let views: Vec<_> = env
+        .framework_state
+        .uikit
+        .ui_view
+        .views
+        .iter()
+        .copied()
+        .filter(|&view| env.objc.borrow::<UIViewHostObject>(view).needs_layout)
+        .collect();
+    // Layout callbacks may remove views, so keep the snapshot alive.
+    for &view in &views {
+        retain(env, view);
+    }
+    for view in views {
+        () = msg![env; view layoutIfNeeded];
+        release(env, view);
+    }
 }
 
 /// Shared parts of `initWithCoder:` and `initWithFrame:`. These can't call
@@ -448,6 +471,28 @@ pub const CLASSES: ClassExports = objc_classes! {
     // nothing.
 }
 
+- (())setNeedsLayout {
+    env.objc.borrow_mut::<UIViewHostObject>(this).needs_layout = true;
+}
+
+- (())layoutIfNeeded {
+    let needs_layout = std::mem::replace(
+        &mut env.objc.borrow_mut::<UIViewHostObject>(this).needs_layout,
+        false,
+    );
+    if needs_layout {
+        () = msg![env; this layoutSubviews];
+    }
+    let subviews = env.objc.borrow::<UIViewHostObject>(this).subviews.clone();
+    for &view in &subviews {
+        retain(env, view);
+    }
+    for view in subviews {
+        () = msg![env; view layoutIfNeeded];
+        release(env, view);
+    }
+}
+
 - (id)superview {
     env.objc.borrow::<UIViewHostObject>(this).superview
 }
@@ -498,6 +543,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         this_obj.subviews.push(view);
         let this_layer = this_obj.layer;
         () = msg![env; this_layer addSublayer:subview_layer];
+        () = msg![env; this setNeedsLayout];
     }
 }
 
@@ -520,6 +566,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     assert!(index >= 0);
     () = msg![env; this_layer insertSublayer:subview_layer atIndex:(index as u32)];
+    () = msg![env; this setNeedsLayout];
 }
 
 - (())insertSubview:(id)view belowSubview:(id)sibling {
@@ -542,6 +589,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     subviews.insert(idx, view);
 
     () = msg![env; this_layer insertSublayer:subview_layer below:sibling_layer];
+    () = msg![env; this setNeedsLayout];
 }
 
 - (())bringSubviewToFront:(id)subview {
@@ -625,6 +673,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         clears_context_before_drawing: _,
         user_interaction_enabled: _,
         multiple_touch_enabled: _,
+        needs_layout: _,
     } = std::mem::take(env.objc.borrow_mut(this));
 
     release(env, layer);
@@ -724,7 +773,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setBounds:(CGRect)bounds {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer setBounds:bounds]
+    let old_bounds: CGRect = msg![env; layer bounds];
+    () = msg![env; layer setBounds:bounds];
+    if old_bounds != bounds {
+        () = msg![env; this setNeedsLayout];
+    }
 }
 - (CGPoint)center {
     // FIXME: what happens if [layer anchorPoint] isn't (0.5, 0.5)?
@@ -741,7 +794,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setFrame:(CGRect)frame {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer setFrame:frame]
+    let old_bounds: CGRect = msg![env; layer bounds];
+    () = msg![env; layer setFrame:frame];
+    let bounds: CGRect = msg![env; layer bounds];
+    if old_bounds.size != bounds.size {
+        () = msg![env; this setNeedsLayout];
+    }
 }
 - (CGAffineTransform)transform {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
