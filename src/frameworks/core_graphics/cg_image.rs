@@ -205,14 +205,20 @@ fn CGImageCreateWithJPEGDataProvider(
     from_image(env, image)
 }
 
-fn CGImageGetAlphaInfo(_env: &mut Environment, _image: CGImageRef) -> CGImageAlphaInfo {
+fn CGImageGetAlphaInfo(_env: &mut Environment, image: CGImageRef) -> CGImageAlphaInfo {
+    if image.is_null() {
+        return kCGImageAlphaNone;
+    }
     // our Image type always returns premultiplied RGBA
     // (the premultiplied part must match what the real UIImage does, but
     // considering CgBI's design, maybe the order doesn't?)
     kCGImageAlphaPremultipliedLast
 }
 
-fn CGImageGetColorSpace(env: &mut Environment, _image: CGImageRef) -> CGColorSpaceRef {
+fn CGImageGetColorSpace(env: &mut Environment, image: CGImageRef) -> CGColorSpaceRef {
+    if image.is_null() {
+        return nil;
+    }
     // Caller must release
     // FIXME: what if a loaded image is not sRGB?
 
@@ -221,6 +227,9 @@ fn CGImageGetColorSpace(env: &mut Environment, _image: CGImageRef) -> CGColorSpa
 }
 
 pub fn CGImageGetWidth(env: &mut Environment, image: CGImageRef) -> GuestUSize {
+    if image.is_null() {
+        return 0;
+    }
     let (width, _height) = env
         .objc
         .borrow::<CGImageHostObject>(image)
@@ -229,6 +238,9 @@ pub fn CGImageGetWidth(env: &mut Environment, image: CGImageRef) -> GuestUSize {
     width
 }
 pub fn CGImageGetHeight(env: &mut Environment, image: CGImageRef) -> GuestUSize {
+    if image.is_null() {
+        return 0;
+    }
     let (_width, height) = env
         .objc
         .borrow::<CGImageHostObject>(image)
@@ -236,10 +248,17 @@ pub fn CGImageGetHeight(env: &mut Environment, image: CGImageRef) -> GuestUSize 
         .dimensions();
     height
 }
-fn CGImageGetBitsPerPixel(_env: &mut Environment, _image: CGImageRef) -> GuestUSize {
-    32
+fn CGImageGetBitsPerPixel(_env: &mut Environment, image: CGImageRef) -> GuestUSize {
+    if image.is_null() {
+        0
+    } else {
+        32
+    }
 }
 fn CGImageGetBytesPerRow(env: &mut Environment, image: CGImageRef) -> GuestUSize {
+    if image.is_null() {
+        return 0;
+    }
     let (width, _height) = env
         .objc
         .borrow::<CGImageHostObject>(image)
@@ -249,6 +268,9 @@ fn CGImageGetBytesPerRow(env: &mut Environment, image: CGImageRef) -> GuestUSize
 }
 
 fn CGImageGetDataProvider(env: &mut Environment, image: CGImageRef) -> CGDataProviderRef {
+    if image.is_null() {
+        return nil;
+    }
     // CGImageGetDataProvider() seems to be intended to return the underlying
     // data provider that is retained by the CGImage. That's not how CGImage is
     // implemented here though, so instead we make a data provider that
@@ -260,8 +282,13 @@ fn CGImageGetDataProvider(env: &mut Environment, image: CGImageRef) -> CGDataPro
     autorelease(env, cg_data_provider)
 }
 
-fn CGImageGetBitsPerComponent(_: &mut Environment, _: CGImageRef) -> GuestUSize {
-    8 // Fix this when we support anything else
+fn CGImageGetBitsPerComponent(_: &mut Environment, image: CGImageRef) -> GuestUSize {
+    // Fix this when we support anything else.
+    if image.is_null() {
+        0
+    } else {
+        8
+    }
 }
 
 fn CGImageCreateWithImageInRect(

@@ -230,6 +230,9 @@ pub fn CGContextConcatCTM(
     transform: CGAffineTransform,
 ) {
     log_dbg!("CGContextConcatCTM({:?})", transform);
+    if context.is_null() {
+        return;
+    }
     let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
     host_obj.transform = transform.concat(host_obj.transform);
 }
@@ -244,6 +247,9 @@ pub fn CGContextRotateCTM(env: &mut Environment, context: CGContextRef, angle: C
     host_obj.transform = host_obj.transform.rotate(angle);
 }
 pub fn CGContextScaleCTM(env: &mut Environment, context: CGContextRef, x: CGFloat, y: CGFloat) {
+    if context.is_null() {
+        return;
+    }
     log_dbg!("CGContextScaleCTM({:?})", (x, y));
     let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
     host_obj.transform = host_obj.transform.scale(x, y);
@@ -255,6 +261,9 @@ pub fn CGContextTranslateCTM(
     ty: CGFloat,
 ) {
     log_dbg!("CGContextTranslateCTM({:?})", (tx, ty));
+    if context.is_null() {
+        return;
+    }
     let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
     host_obj.transform = host_obj.transform.translate(tx, ty);
 }
@@ -265,6 +274,9 @@ pub fn CGContextDrawImage(
     rect: CGRect,
     image: CGImageRef,
 ) {
+    if context.is_null() || image.is_null() {
+        return;
+    }
     cg_bitmap_context::draw_image(env, context, rect, image);
 }
 
