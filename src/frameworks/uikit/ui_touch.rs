@@ -220,15 +220,18 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         // Assumes the windows in the list are ordered back-to-front.
         // TODO: this may not be correct once we support windowLevel.
         let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
-        let Some((window, location_in_window)) = windows.into_iter().rev().find_map(|window| {
-            let location_in_window: CGPoint =
-                msg![env; window convertPoint:location fromWindow:nil];
-            if msg![env; window pointInside:location_in_window withEvent:event] {
-                Some((window, location_in_window))
-            } else {
-                None
-            }
-        }) else {
+        let Some((window, location_in_window, view)) =
+            windows.into_iter().rev().find_map(|window| {
+                let location_in_window: CGPoint =
+                    msg![env; window convertPoint:location fromWindow:nil];
+                let view: id = msg![env; window hitTest:location_in_window withEvent:event];
+                if view != nil {
+                    Some((window, location_in_window, view))
+                } else {
+                    None
+                }
+            })
+        else {
             log!(
                 "Couldn't find a window for touch at {:?}, discarding",
                 location,
@@ -236,26 +239,16 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             continue;
         };
 
-        let view: id = msg![env; window hitTest:location_in_window withEvent:event];
-        if view == nil {
-            log!(
-                "Couldn't find a view for touch at {:?} in window {:?}, discarding",
-                location_in_window,
-                window,
-            );
-            continue;
-        } else {
-            log_dbg!(
-                "Found view {:?} with frame {:?} for touch at {:?} in window {:?}",
-                view,
-                {
-                    let f: CGRect = msg![env; view frame];
-                    f
-                },
-                location_in_window,
-                window,
-            );
-        }
+        log_dbg!(
+            "Found view {:?} with frame {:?} for touch at {:?} in window {:?}",
+            view,
+            {
+                let f: CGRect = msg![env; view frame];
+                f
+            },
+            location_in_window,
+            window,
+        );
 
         let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];
         if !is_multi_touch_enabled {
