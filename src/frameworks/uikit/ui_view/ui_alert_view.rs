@@ -4,13 +4,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 //! `UIAlertView`.
-//! TODO: animations, automatic text wrapping, and updating visible alerts.
+//! TODO: animations and updating visible alerts.
 
 use super::ui_control::{UIControlEventTouchUpInside, UIControlStateNormal};
 use super::UIViewHostObject;
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::{ns_string, NSInteger};
-use crate::frameworks::uikit::ui_font::UITextAlignmentCenter;
+use crate::frameworks::uikit::ui_font::{self, UILineBreakModeWordWrap, UITextAlignmentCenter};
 use crate::objc::{
     id, impl_HostObject_with_superclass, msg, msg_class, msg_send, msg_super, nil, objc_classes,
     release, retain, ClassExports, NSZonePtr,
@@ -77,10 +77,33 @@ fn add_label(env: &mut Environment, this: id, text: id, frame: CGRect, size: f32
     () = msg![env; label setFont:font];
     () = msg![env; label setTextAlignment:UITextAlignmentCenter];
     () = msg![env; label setNumberOfLines:0i32];
+    () = msg![env; label setLineBreakMode:UILineBreakModeWordWrap];
     () = msg![env; label setText:text];
     // Keep application-provided controls above the labels.
     () = msg![env; this insertSubview:label atIndex:0i32];
     release(env, label);
+}
+
+fn text_height(env: &mut Environment, text: id, font_size: f32) -> f32 {
+    if text == nil {
+        return 0.0;
+    }
+    let text = ns_string::to_rust_string(env, text);
+    let font = msg_class![env; UIFont systemFontOfSize:font_size];
+    ui_font::size_with_font(
+        env,
+        font,
+        &text,
+        Some((
+            CGSize {
+                width: 264.0,
+                height: f32::MAX,
+            },
+            UILineBreakModeWordWrap,
+        )),
+    )
+    .height
+    .ceil()
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -169,7 +192,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host = env.objc.borrow::<UIAlertViewHostObject>(this);
     let (title, message, buttons, decorated) = (host.title, host.message, host.buttons.clone(), host.decorated);
     let lines = if message == nil { 0 } else { ns_string::to_rust_string(env, message).split('\n').count() };
-    let button_y = 50.0 + lines as f32 * 20.0;
+    let title_height = text_height(env, title, 20.0).max(30.0);
+    // Preserve space reserved with blank lines for application-added controls.
+    let message_height = text_height(env, message, 16.0).max(lines as f32 * 20.0);
+    let message_y = 15.0 + title_height;
+    let button_y = message_y + message_height + 5.0;
     let rows = if buttons.len() <= 2 { 1 } else { buttons.len() };
     let height = button_y + rows as f32 * 44.0 + 10.0;
     let screen: id = msg_class![env; UIScreen mainScreen];
@@ -180,8 +207,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     let background: id = msg_class![env; UIColor colorWithRed:0.15f32 green:0.18f32 blue:0.25f32 alpha:1.0f32];
     () = msg![env; this setBackgroundColor:background];
     if !decorated {
-        add_label(env, this, title, rect(10.0, 10.0, 264.0, 30.0), 20.0);
-        add_label(env, this, message, rect(10.0, 45.0, 264.0, lines as f32 * 20.0), 16.0);
+        add_label(env, this, title, rect(10.0, 10.0, 264.0, title_height), 20.0);
+        add_label(env, this, message, rect(10.0, message_y, 264.0, message_height), 16.0);
         let action = env.objc.lookup_selector("_touchHLE_alertButtonTapped:").unwrap();
         for (index, title) in buttons.into_iter().enumerate() {
             let count: NSInteger = msg![env; this numberOfButtons];
