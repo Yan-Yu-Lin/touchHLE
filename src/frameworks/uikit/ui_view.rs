@@ -74,7 +74,7 @@ pub struct State {
     pub animation_block_count: usize,
 }
 
-pub(super) struct UIViewHostObject {
+pub(crate) struct UIViewHostObject {
     /// CALayer or subclass.
     layer: id,
     /// Subviews in back-to-front order. These are strong references.

@@ -34,6 +34,7 @@ pub mod core_motion;
 pub mod core_telephony;
 pub mod foundation;
 pub mod game_kit;
+pub mod i_ad;
 pub mod media_player;
 pub mod message_ui;
 pub mod openal;
