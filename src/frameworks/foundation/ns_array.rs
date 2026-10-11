@@ -665,6 +665,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<ArrayHostObject>(this).array.push(object);
 }
 
+- (())removeObjectsInArray:(id)array {
+    // Snapshot the argument in case the receiver is also the source array.
+    let array: id = msg![env; array copy];
+    let count: NSUInteger = msg![env; array count];
+    for i in 0..count {
+        let object: id = msg![env; array objectAtIndex:i];
+        () = msg![env; this removeObject:object];
+    }
+    release(env, array);
+}
+
 - (())removeObject:(id)object {
     let mut to_remove = Vec::new();
     let count: NSUInteger = msg![env; this count];
@@ -676,7 +687,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
     // TODO: runtime here is O(n^2), it could be O(n) instead
-    for i in to_remove {
+    for i in to_remove.into_iter().rev() {
         () = msg![env; this removeObjectAtIndex:i];
     }
 }
