@@ -417,6 +417,18 @@ pub fn draw_in_rect(
     text_size
 }
 
+/// Use the same bundled font substitutions for UIKit and Core Graphics.
+pub fn font_by_name<'a>(env: &'a mut Environment, name: &str) -> &'a Font {
+    let kind = get_equivalent_font(name).unwrap_or_else(|| {
+        log!(
+            "No replacement found for font {}. Using system font instead.",
+            name
+        );
+        FontKind::SansRegular
+    });
+    env.framework_state.uikit.ui_font.get_font_by_kind(kind)
+}
+
 fn get_equivalent_font(system_font: &str) -> Option<FontKind> {
     // Maps every font found in every font family in an iOS 2 Simulator
     match system_font {

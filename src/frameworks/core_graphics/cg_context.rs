@@ -348,6 +348,52 @@ fn CGContextSetFontSize(env: &mut Environment, context: CGContextRef, size: CGFl
         .font_size = size;
 }
 
+fn CGContextSelectFont(
+    env: &mut Environment,
+    context: CGContextRef,
+    name: ConstPtr<u8>,
+    size: CGFloat,
+    encoding: i32,
+) {
+    // kCGEncodingMacRoman. TODO: kCGEncodingFontSpecific.
+    assert_eq!(encoding, 1);
+    if context.is_null() {
+        return;
+    }
+    let name = env.mem.cstr_at_utf8(name).unwrap().to_owned();
+    let font = uikit::ui_font::font_by_name(env, &name).clone();
+    let class = env.objc.get_known_class("_touchHLE_CGFont", &mut env.mem);
+    let font = env
+        .objc
+        .alloc_object(class, Box::new(CGFontHostObject { font }), &mut env.mem);
+    CGContextSetFont(env, context, font);
+    CGContextSetFontSize(env, context, size);
+    CGFontRelease(env, font);
+}
+
+fn CGContextShowTextAtPoint(
+    env: &mut Environment,
+    context: CGContextRef,
+    x: CGFloat,
+    y: CGFloat,
+    text: ConstPtr<u8>,
+    length: GuestUSize,
+) {
+    if context.is_null() {
+        return;
+    }
+    let font = env.objc.borrow::<CGContextHostObject>(context).font;
+    let font = &env.objc.borrow::<CGFontHostObject>(font).font;
+    let bytes = env.mem.bytes_at(text, length);
+    let (text, _) = encoding_rs::MACINTOSH.decode_without_bom_handling(bytes);
+    let glyphs = text
+        .encode_utf16()
+        .map(|c| font.glyph_id_for_char(c))
+        .collect();
+    draw_glyphs_at_point(env, context, x, y, glyphs);
+    // TODO: update the text position after drawing.
+}
+
 fn CGContextSetTextDrawingMode(
     _env: &mut Environment,
     _context: CGContextRef,
@@ -381,6 +427,16 @@ fn CGContextShowGlyphsAtPoint(
         glyph_ids.push(rusttype::GlyphId(glyph_id));
     }
 
+    draw_glyphs_at_point(env, context, x, y, glyph_ids);
+}
+
+fn draw_glyphs_at_point(
+    env: &mut Environment,
+    context: CGContextRef,
+    x: CGFloat,
+    y: CGFloat,
+    glyph_ids: Vec<rusttype::GlyphId>,
+) {
     let font = env.objc.borrow::<CGContextHostObject>(context).font;
     let font_size = env.objc.borrow::<CGContextHostObject>(context).font_size;
     let text_transform = env
@@ -467,6 +523,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextSetShouldSmoothFonts(_, _)),
     export_c_func!(CGContextSetFont(_, _)),
     export_c_func!(CGContextSetFontSize(_, _)),
+    export_c_func!(CGContextSelectFont(_, _, _, _)),
+    export_c_func!(CGContextShowTextAtPoint(_, _, _, _, _)),
     export_c_func!(CGContextSetTextDrawingMode(_, _)),
     export_c_func!(CGContextSetTextMatrix(_, _)),
     export_c_func!(CGContextShowGlyphsAtPoint(_, _, _, _, _)),
