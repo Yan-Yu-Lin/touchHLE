@@ -64,7 +64,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setFrameInterval:(NSInteger)frameInterval {
     log_dbg!("[(CADisplayLink*){:?} setFrameInterval:{}]", this, frameInterval);
-    assert!(frameInterval >= 1);
+    // Values below one are undefined by the API, but some games pass zero.
+    // Keep the existing interval rather than aborting the emulator.
+    if frameInterval < 1 {
+        log!("Ignoring invalid CADisplayLink frame interval {}", frameInterval);
+        return;
+    }
     let interval = frameInterval as f64 / 60.0;
     let ns_timer = env.objc.borrow::<CADisplayLinkHostObject>(this).ns_timer;
     set_time_interval(env, ns_timer, interval);
