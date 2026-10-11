@@ -18,11 +18,12 @@ use std::str::FromStr;
 use std::time::SystemTime;
 
 pub mod qsort;
+mod random;
 
 #[derive(Default)]
 pub struct State {
     rand: u32,
-    random: u32,
+    random: random::Random,
     arc4random: u32,
     fcvt_buf: Option<MutPtr<u8>>,
 }
@@ -220,20 +221,17 @@ fn rand_r(env: &mut Environment, seed_ptr: MutPtr<u32>) -> i32 {
     (seed as i32) & RAND_MAX
 }
 
-// BSD's "better" random number generator, with an implementation that is not
-// actually better.
 fn srandom(env: &mut Environment, seed: u32) {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    env.libc_state.stdlib.random = seed;
+    env.libc_state.stdlib.random = random::Random::new(seed);
 }
 fn random(env: &mut Environment) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    env.libc_state.stdlib.random = prng(env.libc_state.stdlib.random);
-    (env.libc_state.stdlib.random as i32) & RAND_MAX
+    env.libc_state.stdlib.random.next()
 }
 
 fn arc4random(env: &mut Environment) -> u32 {
