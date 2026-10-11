@@ -97,6 +97,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<ErrorHostObject>(this).code
 }
 
+- (NSErrorDomain)domain {
+    env.objc.borrow::<ErrorHostObject>(this).domain
+}
+
 @end
 
 };
