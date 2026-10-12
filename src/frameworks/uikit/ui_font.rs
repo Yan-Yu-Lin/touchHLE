@@ -39,6 +39,10 @@ impl State {
                 FontKind::SerifBold => Font::serif_bold(),
                 FontKind::SerifBoldItalic => Font::serif_bold_italic(),
                 FontKind::SerifItalic => Font::serif_italic(),
+                FontKind::TrebuchetRegular => host_trebuchet("Trebuchet MS.ttf"),
+                FontKind::TrebuchetBold => host_trebuchet("Trebuchet MS Bold.ttf"),
+                FontKind::TrebuchetItalic => host_trebuchet("Trebuchet MS Italic.ttf"),
+                FontKind::TrebuchetBoldItalic => host_trebuchet("Trebuchet MS Bold Italic.ttf"),
             })
     }
 }
@@ -57,6 +61,29 @@ enum FontKind {
     SerifBold,
     SerifBoldItalic,
     SerifItalic,
+    TrebuchetRegular,
+    TrebuchetBold,
+    TrebuchetItalic,
+    TrebuchetBoldItalic,
+}
+
+/// Optional fonts stay on the host; never copy them into touchHLE resources.
+/// State::fonts caches both successful loads and the fallback.
+fn host_trebuchet(filename: &str) -> Font {
+    #[cfg(target_os = "macos")]
+    {
+        let path = std::path::Path::new("/System/Library/Fonts/Supplemental").join(filename);
+        if let Some(font) = Font::try_from_host_file(&path) {
+            log!("Loaded host font {}", path.display());
+            return font;
+        }
+    }
+    log!(
+        "Host font {} unavailable. Using system font instead.",
+        filename
+    );
+    // Preserve the previous fallback, including for unavailable bold faces.
+    Font::sans_regular()
 }
 
 struct UIFontHostObject {
@@ -204,13 +231,13 @@ fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {
            (0x3400..=0x4DBF).contains(&c) { // more kanji
             match kind {
                 // CJK has no italic equivalent
-                FontKind::MonoRegular | FontKind::MonoItalic | FontKind::SansRegular | FontKind::SansItalic | FontKind::SerifRegular | FontKind::SerifItalic => {
+                FontKind::MonoRegular | FontKind::MonoItalic | FontKind::SansRegular | FontKind::SansItalic | FontKind::SerifRegular | FontKind::SerifItalic | FontKind::TrebuchetRegular | FontKind::TrebuchetItalic => {
                     if state.sans_regular_ja.is_none() {
                         state.sans_regular_ja = Some(Font::sans_regular_ja());
                     }
                     return state.sans_regular_ja.as_ref().unwrap();
                 },
-                FontKind::MonoBold | FontKind::MonoBoldItalic | FontKind::SansBold | FontKind::SansBoldItalic | FontKind::SerifBold | FontKind::SerifBoldItalic => {
+                FontKind::MonoBold | FontKind::MonoBoldItalic | FontKind::SansBold | FontKind::SansBoldItalic | FontKind::SerifBold | FontKind::SerifBoldItalic | FontKind::TrebuchetBold | FontKind::TrebuchetBoldItalic => {
                     if state.sans_bold_ja.is_none() {
                         state.sans_bold_ja = Some(Font::sans_bold_ja());
                     }
@@ -417,7 +444,8 @@ pub fn draw_in_rect(
     text_size
 }
 
-/// Use the same bundled font substitutions for UIKit and Core Graphics.
+/// Use the same font resolution for UIKit and Core Graphics, including
+/// optional host fonts.
 pub fn font_by_name<'a>(env: &'a mut Environment, name: &str) -> &'a Font {
     let kind = get_equivalent_font(name).unwrap_or_else(|| {
         log!(
@@ -432,6 +460,10 @@ pub fn font_by_name<'a>(env: &'a mut Environment, name: &str) -> &'a Font {
 fn get_equivalent_font(system_font: &str) -> Option<FontKind> {
     // Maps every font found in every font family in an iOS 2 Simulator
     match system_font {
+        "TrebuchetMS" => Some(FontKind::TrebuchetRegular),
+        "TrebuchetMS-Bold" => Some(FontKind::TrebuchetBold),
+        "TrebuchetMS-Italic" => Some(FontKind::TrebuchetItalic),
+        "Trebuchet-BoldItalic" | "TrebuchetMS-BoldItalic" => Some(FontKind::TrebuchetBoldItalic),
         // Font Family: Courier
         "Courier" => None,
         "Courier-BoldOblique" => None,
@@ -493,5 +525,36 @@ fn get_equivalent_font(system_font: &str) -> Option<FontKind> {
         "Georgia-BoldItalic" => None,
         "Georgia-Italic" => None,
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod host_font_tests {
+    use super::*;
+
+    #[test]
+    fn trebuchet_faces_and_missing_font_fallback() {
+        assert!(matches!(
+            get_equivalent_font("TrebuchetMS"),
+            Some(FontKind::TrebuchetRegular)
+        ));
+        assert!(matches!(
+            get_equivalent_font("TrebuchetMS-Bold"),
+            Some(FontKind::TrebuchetBold)
+        ));
+        assert!(matches!(
+            get_equivalent_font("TrebuchetMS-Italic"),
+            Some(FontKind::TrebuchetItalic)
+        ));
+        assert!(matches!(
+            get_equivalent_font("Trebuchet-BoldItalic"),
+            Some(FontKind::TrebuchetBoldItalic)
+        ));
+        let fallback = host_trebuchet("no-such-optional-font.ttf");
+        let regular = Font::sans_regular();
+        assert_eq!(
+            fallback.calculate_text_size(8.0, "Tanker  Lv. 4", None),
+            regular.calculate_text_size(8.0, "Tanker  Lv. 4", None)
+        );
     }
 }

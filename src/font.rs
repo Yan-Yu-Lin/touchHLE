@@ -113,6 +113,16 @@ impl Font {
         }
     }
 
+    /// Load an optional host font without requiring it in the distribution.
+    /// UIKit sizes are em sizes, whereas RustType scales ascent minus descent.
+    pub fn try_from_host_file(path: &std::path::Path) -> Option<Font> {
+        let bytes = std::fs::read(path).ok()?;
+        let font = rusttype::Font::try_from_vec(bytes)?;
+        let metrics = font.v_metrics_unscaled();
+        let scale_factor = (metrics.ascent - metrics.descent) / font.units_per_em() as f32;
+        Some(Font { font, scale_factor })
+    }
+
     pub fn mono_regular() -> Font {
         Self::from_resource_file("LiberationMono-Regular.ttf")
     }
@@ -629,5 +639,24 @@ impl Font {
 
             draw_glyph(raster_glyph);
         }
+    }
+}
+
+#[cfg(test)]
+mod host_font_tests {
+    use super::*;
+
+    #[test]
+    fn optional_host_font_uses_em_size() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Use a redistributable fixture, not a required proprietary host font.
+        let font =
+            Font::try_from_host_file(&root.join("touchHLE_fonts/LiberationSans-Regular.ttf"))
+                .unwrap();
+        let size = 16.0;
+        let expected = font.ascent_unscaled() * size / font.units_per_em() as f32;
+        assert!((font.ascent(size) - expected).abs() < 0.0001);
+        assert!(Font::try_from_host_file(&root.join("no-such-optional-font.ttf")).is_none());
+        assert!(Font::try_from_host_file(&root.join("src/font.rs")).is_none());
     }
 }
